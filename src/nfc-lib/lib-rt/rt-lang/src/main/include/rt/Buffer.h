@@ -26,6 +26,8 @@
 #include <cstring>
 #include <memory>
 #include <functional>
+#include <algorithm>
+#include <vector>
 
 #include <rt/Heap.h>
 
@@ -52,15 +54,15 @@ class Buffer
       {
          unsigned int position; // current data position
          unsigned int capacity; // buffer data capacity
-         unsigned int limit; // buffer data limit
+         unsigned int limit;    // buffer data limit
       } state;
 
       struct Attrs
       {
-         unsigned int type; // data type
-         unsigned int stride; // data stride, how many data has in one chunk for all channels
+         unsigned int type;       // data type
+         unsigned int stride;     // data stride, how many data has in one chunk for all channels
          unsigned int interleave; // data interleave, how many consecutive data has per channel
-         void *context; // context payload
+         void *context;           // context payload
       } attrs;
 
    public:
@@ -89,7 +91,7 @@ class Buffer
          alloc = heap.alloc(capacity, ALLOC_ALIGNMENT);
       }
 
-      Buffer(std::initializer_list<T> data, unsigned int type = 0, unsigned int stride = 1, unsigned int interleave = 1, void *context = nullptr) : Buffer(data.size(), type, stride, interleave, context)
+      Buffer(std::initializer_list<T> data, unsigned int type = 0, unsigned int stride = 1, unsigned int interleave = 1, void *context = nullptr) : Buffer(static_cast<unsigned int>(data.size()), type, stride, interleave, context)
       {
          put(data);
          flip();
@@ -120,7 +122,7 @@ class Buffer
          if (alloc == other.alloc)
             return true;
 
-         return std::memcmp(ptr(), other.ptr(), remaining()) == 0;
+         return std::memcmp(ptr(), other.ptr(), remaining() * sizeof(T)) == 0;
       }
 
       bool operator!=(const Buffer &other) const
@@ -222,18 +224,26 @@ class Buffer
 
       Buffer &resize(unsigned int newCapacity)
       {
-         assert(alloc != nullptr);
+         if (!alloc)
+         {
+            alloc = heap.alloc(newCapacity, ALLOC_ALIGNMENT);
+            state.capacity = newCapacity;
+            state.limit = newCapacity;
+            state.position = 0;
+            return *this;
+         }
 
-         const int count = std::min(newCapacity, state.limit);
+         const unsigned int count = std::min(newCapacity, state.limit);
 
-         Alloc<T> newAlloc = heap.acquire(newCapacity, ALLOC_ALIGNMENT);
+         std::shared_ptr<Alloc<T>> newAlloc = heap.alloc(newCapacity, ALLOC_ALIGNMENT);
 
-         std::memcpy(newAlloc->data, alloc->data, count * sizeof(T));
-
-         heap.release(alloc);
+         if (count > 0 && alloc->data && newAlloc->data)
+         {
+            std::memcpy(newAlloc->data, alloc->data, count * sizeof(T));
+         }
 
          alloc = newAlloc;
-         state.limit = newCapacity > state.limit ? state.limit : newCapacity;
+         state.limit = std::min(newCapacity, state.limit);
          state.capacity = newCapacity;
 
          return *this;
@@ -252,9 +262,18 @@ class Buffer
       Buffer &fill(T value, unsigned int count)
       {
          assert(alloc != nullptr);
-         assert(state.position + count <= state.limit);
 
-         memset(alloc->data + state.position, value, count * sizeof(T));
+         if (state.position + count > state.capacity)
+         {
+            resize(std::max(state.capacity * 2, state.position + count));
+         }
+
+         if (state.position + count > state.limit)
+         {
+            state.limit = state.capacity;
+         }
+
+         std::memset(alloc->data + state.position, value, count * sizeof(T));
 
          state.position += count;
 
@@ -283,7 +302,11 @@ class Buffer
       Buffer &room(unsigned int size)
       {
          assert(alloc != nullptr);
-         assert(state.limit + size <= state.capacity);
+         
+         if (state.limit + size > state.capacity)
+         {
+            resize(state.capacity + size);
+         }
 
          state.limit += size;
 
@@ -324,12 +347,23 @@ class Buffer
       }
 
       /*
-       * add one element to tail
+       * add one element to tail (auto-resizes on boundary overrun)
        */
       Buffer &put(const T &value)
       {
-         assert(alloc != nullptr);
-         assert(state.position < state.limit);
+         if (!alloc)
+         {
+            resize(16);
+         }
+         else if (state.position >= state.capacity)
+         {
+            resize(state.capacity == 0 ? 16 : state.capacity * 2);
+         }
+
+         if (state.position >= state.limit)
+         {
+            state.limit = state.capacity;
+         }
 
          alloc->data[state.position++] = value;
 
@@ -363,7 +397,7 @@ class Buffer
       }
 
       /**
-       Read elements from head (without update head pointer)
+        Read elements from head (without update head pointer)
        */
       const Buffer &peek(T *data, unsigned int elements) const
       {
@@ -391,12 +425,23 @@ class Buffer
       }
 
       /*
-       * add elements from head
+       * add elements from head (auto-resizes on boundary overrun)
        */
       Buffer &put(const T *data, unsigned int elements)
       {
-         assert(alloc != nullptr);
-         assert(elements <= state.limit - state.position);
+         if (!alloc)
+         {
+            resize(elements);
+         }
+         else if (state.position + elements > state.capacity)
+         {
+            resize(std::max(state.capacity * 2, state.position + elements));
+         }
+
+         if (state.position + elements > state.limit)
+         {
+            state.limit = state.capacity;
+         }
 
          std::memcpy(alloc->data + state.position, data, elements * sizeof(T));
 
@@ -413,7 +458,7 @@ class Buffer
          assert(alloc != nullptr);
          assert(data.remaining() >= elements);
 
-         int count = std::min(elements, state.limit - state.position);
+         unsigned int count = std::min(elements, state.limit - state.position);
          data.put(alloc->data + state.position, count);
          data.flip();
 
@@ -430,7 +475,7 @@ class Buffer
          assert(alloc != nullptr);
          assert(data.remaining() >= elements);
 
-         int count = std::min(elements, state.limit - state.position);
+         unsigned int count = std::min(elements, state.limit - state.position);
          data.put(alloc->data + state.position, count);
          data.flip();
 
@@ -457,7 +502,6 @@ class Buffer
       Buffer &put(const Buffer &data, unsigned int elements)
       {
          assert(alloc != nullptr);
-         assert(elements <= state.limit - state.position);
          assert(data.remaining() >= elements);
 
          put(data.ptr(), elements);
@@ -513,7 +557,7 @@ class Buffer
       T *pull(unsigned int elements, bool clear = false)
       {
          assert(alloc != nullptr);
-         assert(state.position - elements >= 0);
+         assert(state.position >= elements);
 
          state.position -= elements;
 
@@ -525,16 +569,18 @@ class Buffer
 
       Buffer &rotate(Direction dir, unsigned int count = 1)
       {
+         if (state.capacity == 0) return *this;
+
          if (count > state.capacity)
             count %= state.capacity;
 
-         T tmp[count];
+         std::vector<T> tmp(count);
 
          switch (dir)
          {
             case Left:
             {
-               for (int i = 0; i < state.capacity; ++i)
+               for (unsigned int i = 0; i < state.capacity; ++i)
                {
                   if (i < count)
                      tmp[i] = alloc->data[i];
@@ -550,15 +596,16 @@ class Buffer
 
             case Right:
             {
-               for (int i = state.capacity - 1; i >= 0; --i)
+               for (int i = static_cast<int>(state.capacity) - 1; i >= 0; --i)
                {
-                  if (i >= state.capacity - count)
-                     tmp[i - state.capacity + count] = alloc->data[i];
+                  unsigned int idx = static_cast<unsigned int>(i);
+                  if (idx >= state.capacity - count)
+                     tmp[idx - state.capacity + count] = alloc->data[idx];
 
-                  if (i >= count)
-                     alloc->data[i] = alloc->data[i - count];
+                  if (idx >= count)
+                     alloc->data[idx] = alloc->data[idx - count];
                   else
-                     alloc->data[i] = tmp[i];
+                     alloc->data[idx] = tmp[idx];
                }
 
                break;
@@ -570,6 +617,8 @@ class Buffer
 
       Buffer &shift(Direction dir, unsigned int count = 1)
       {
+         if (state.capacity == 0) return *this;
+
          if (count > state.capacity)
             count %= state.capacity;
 
@@ -577,7 +626,7 @@ class Buffer
          {
             case Left:
             {
-               for (int i = 0; i < state.capacity; ++i)
+               for (unsigned int i = 0; i < state.capacity; ++i)
                {
                   if (i < state.capacity - count)
                      alloc->data[i] = alloc->data[i + count];
@@ -590,12 +639,13 @@ class Buffer
 
             case Right:
             {
-               for (int i = state.capacity - 1; i >= 0; --i)
+               for (int i = static_cast<int>(state.capacity) - 1; i >= 0; --i)
                {
-                  if (i >= count)
-                     alloc->data[i] = alloc->data[i - count];
+                  unsigned int idx = static_cast<unsigned int>(i);
+                  if (idx >= count)
+                     alloc->data[idx] = alloc->data[idx - count];
                   else
-                     alloc->data[i] = 0;
+                     alloc->data[idx] = 0;
                }
 
                break;
@@ -613,7 +663,7 @@ class Buffer
 
          T *src = data.ptr();
 
-         for (int i = 0; i < elements; i++)
+         for (unsigned int i = 0; i < elements; i++)
             alloc->data[offset + i] = src[i];
 
          return *this;
@@ -639,7 +689,7 @@ class Buffer
       {
          assert(alloc != nullptr);
 
-         for (int i = state.position; i < state.limit; ++i)
+         for (unsigned int i = state.position; i < state.limit; ++i)
             value = handler(value, alloc->data[i]);
 
          return value;
@@ -649,7 +699,7 @@ class Buffer
       {
          assert(alloc != nullptr);
 
-         for (int i = state.position; i < state.limit; i += attrs.stride)
+         for (unsigned int i = state.position; i < state.limit; i += attrs.stride)
             handler(alloc->data + i, attrs.stride);
       }
 
